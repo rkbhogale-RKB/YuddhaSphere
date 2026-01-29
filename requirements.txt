@@ -1,7 +1,6 @@
 streamlit
-yfinance
-pandas
+streamlit-folium
+folium
+geopandas  # optional, for nicer shapes
 numpy
-plotly
-scikit-learn
-tensorflow==2.19.0   # match your Colab version (from earlier print)
+pandas

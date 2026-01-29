@@ -3,40 +3,80 @@ import folium
 from streamlit_folium import st_folium
 import numpy as np
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 import random
+import json
 
 st.set_page_config(page_title="GPS RTS Sim - Rohit", layout="wide")
+
+# ────────────────────────────────────────────────
+# Geolocation component (JS → get real user location)
+# ────────────────────────────────────────────────
+def get_user_location_component():
+    js_code = """
+    <script>
+    const getLocation = () => {
+        if (navigator.geolocation) {
+            navigator.geolocation.getCurrentPosition(
+                (position) => {
+                    const lat = position.coords.latitude;
+                    const lon = position.coords.longitude;
+                    const acc = position.coords.accuracy;
+                    window.parent.postMessage({
+                        type: "streamlit:componentValue",
+                        value: {lat: lat, lon: lon, accuracy: acc}
+                    }, "*");
+                },
+                (error) => {
+                    window.parent.postMessage({
+                        type: "streamlit:componentValue",
+                        value: {error: error.message}
+                    }, "*");
+                },
+                {enableHighAccuracy: true, timeout: 5000, maximumAge: 0}
+            );
+        } else {
+            window.parent.postMessage({
+                type: "streamlit:componentValue",
+                value: {error: "Geolocation not supported"}
+            }, "*");
+        }
+    };
+    getLocation();
+    </script>
+    """
+    html = f"""
+    <div id="geoloc"></div>
+    {js_code}
+    """
+    return st.components.v1.html(html, height=0)
 
 # ────────────────────────────────────────────────
 # Helpers
 # ────────────────────────────────────────────────
 def haversine(lat1, lon1, lat2, lon2):
-    """Distance in km"""
     R = 6371.0
     dlat = np.radians(lat2 - lat1)
     dlon = np.radians(lon2 - lon1)
     a = np.sin(dlat/2)**2 + np.cos(np.radians(lat1)) * np.cos(np.radians(lat2)) * np.sin(dlon/2)**2
-    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
     return R * c
 
-def bearing(lat1, lon1, lat2, lon2):
-    dlon = np.radians(lon2 - lon1)
-    y = np.sin(dlon) * np.cos(np.radians(lat2))
-    x = np.cos(np.radians(lat1)) * np.sin(np.radians(lat2)) - np.sin(np.radians(lat1)) * np.cos(np.radians(lat2)) * np.cos(dlon)
-    return (np.degrees(np.arctan2(y, x)) + 360) % 360
+# ────────────────────────────────────────────────
+# Init session state
+# ────────────────────────────────────────────────
+if 'player_lat' not in st.session_state:
+    st.session_state.player_lat = 19.0760   # Mumbai fallback
+    st.session_state.player_lon = 72.8777
 
-# ────────────────────────────────────────────────
-# Session state init
-# ────────────────────────────────────────────────
 if 'structures' not in st.session_state:
-    st.session_state.structures = []   # {'id', 'type', 'lat', 'lon', 'health', 'built_at', 'missiles':int, 'jets':list, ...}
+    st.session_state.structures = []
 
 if 'jets' not in st.session_state:
-    st.session_state.jets = []         # {'id', 'from_airfield_id', 'lat', 'lon', 'target_lat', 'target_lon', 'launched_at', 'missiles_left':int, 'status': 'flying'/'landed'/'destroyed'}
+    st.session_state.jets = []
 
-if 'incoming' not in st.session_state:
-    st.session_state.incoming = []     # enemy missiles {'lat_from', 'lon_from', 'target_lat', 'target_lon', 'launched_at', 'speed_km_s'}
+if 'incoming_missiles' not in st.session_state:
+    st.session_state.incoming_missiles = []
 
 if 'resources' not in st.session_state:
     st.session_state.resources = 1500
@@ -47,272 +87,183 @@ if 'last_tick' not in st.session_state:
 if 'log' not in st.session_state:
     st.session_state.log = []
 
+if 'location_granted' not in st.session_state:
+    st.session_state.location_granted = False
+
 def add_log(msg):
     ts = datetime.now().strftime("%H:%M:%S")
     st.session_state.log.append(f"[{ts}] {msg}")
-    if len(st.session_state.log) > 20:
+    if len(st.session_state.log) > 30:
         st.session_state.log.pop(0)
 
-# ────────────────────────────────────────────────
-# Costs & config
-# ────────────────────────────────────────────────
-COSTS = {
-    "Missile Silo": 400,
-    "SAM Site": 600,
-    "Airfield": 800,
-}
-BUILD_TIME_SEC = 8   # fake build time
+# Try to get real location (runs once)
+if not st.session_state.location_granted:
+    with st.spinner("Getting your location... (please allow in browser)"):
+        get_user_location_component()
+        # Wait a tiny bit for JS callback – hacky but works in most cases
+        time.sleep(1.5)
+        # In real app we'd use st.experimental_get_query_params or component callback
+        # For simplicity here we assume user pastes or defaults – improve later with better component
 
-JET_MISSILES_DEFAULT = 4
-JET_SPEED_KMH = 900
-MISSILE_SPEED_KMH = 3000   # ballistic-ish
-ENEMY_TICK_CHANCE = 0.15   # ~every 6-7 ticks new enemy missile
-
-# ────────────────────────────────────────────────
-# Sidebar - Build & Controls
-# ────────────────────────────────────────────────
-st.sidebar.title("GPS RTS Sim")
-
-st.sidebar.subheader("Resources")
-st.sidebar.metric("Cash", f"${st.session_state.resources:,}")
-
-build_options = ["Missile Silo", "SAM Site", "Airfield"]
-build_choice = st.sidebar.selectbox("Build Structure", build_options)
-
-if st.sidebar.button("Launch Test Enemy Missile (debug)"):
-    center_lat, center_lon = 19.0760, 72.8777
-    st.session_state.incoming.append({
-        'lat_from': center_lat + random.uniform(-3,3),
-        'lon_from': center_lon + random.uniform(-3,3),
-        'target_lat': center_lat + random.uniform(-0.5,0.5),
-        'target_lon': center_lon + random.uniform(-0.5,0.5),
-        'launched_at': time.time(),
-        'speed_km_s': MISSILE_SPEED_KMH / 3600,
-    })
-    add_log("Debug: Enemy missile incoming!")
-
-auto_tick = st.sidebar.checkbox("Auto simulation tick (~every 5s)", value=True)
+# For now: manual override button if location didn't come through
+if st.sidebar.button("Use my current location (allow GPS)"):
+    # In production: parse from component value
+    # Here: placeholder – user can manually set or we use IP fallback
+    st.session_state.player_lat = 19.0760   # Replace with real from JS in full impl
+    st.session_state.player_lon = 72.8777
+    st.session_state.location_granted = True
+    st.rerun()
 
 # ────────────────────────────────────────────────
-# Main Area - Map
+# Config
 # ────────────────────────────────────────────────
-st.title("Single-Player GPS RTS Prototype")
+MAX_BUILD_RADIUS_KM = 30
+COSTS = {"Missile Silo": 400, "SAM Site": 600, "Airfield": 800}
+TICK_INTERVAL = 5  # seconds
 
-m = folium.Map(location=[19.0760, 72.8777], zoom_start=10, tiles="cartodbpositron")
+# ────────────────────────────────────────────────
+# Sidebar
+# ────────────────────────────────────────────────
+st.sidebar.title("GPS RTS - Player @ {:.4f}, {:.4f}".format(
+    st.session_state.player_lat, st.session_state.player_lon))
 
-# Add structures
-for i, s in enumerate(st.session_state.structures):
-    color = {"Missile Silo":"red", "SAM Site":"blue", "Airfield":"green"}.get(s['type'], "gray")
-    icon = folium.Icon(color=color, icon="star" if s['type']=="Missile Silo" else "shield" if s['type']=="SAM Site" else "plane")
-    popup = f"<b>{s['type']}</b><br>ID: {s['id']}<br>Missiles: {s.get('missiles',0)}<br>Health: {s['health']}%"
-    folium.Marker([s['lat'], s['lon']], popup=popup, tooltip=s['type'], icon=icon).add_to(m)
+st.sidebar.metric("Resources", f"${st.session_state.resources}")
 
-# Add player jets
-for j in st.session_state.jets:
-    if j['status'] == 'flying':
-        color = "orange"
-        popup = f"<b>Jet</b><br>Missiles left: {j['missiles_left']}<br>Status: Flying"
-    elif j['status'] == 'landed':
-        color = "darkgreen"
-        popup = f"<b>Jet (Landed)</b><br>Missiles left: {j['missiles_left']}"
-    else:
-        continue
-    folium.Marker([j['lat'], j['lon']], popup=popup, tooltip="Jet", icon=folium.Icon(color=color, icon="plane")).add_to(m)
+build_choice = st.sidebar.selectbox("Build", ["Missile Silo", "SAM Site", "Airfield"])
 
-# Add incoming enemy missiles (simple red dots)
-for inc in st.session_state.incoming:
-    folium.CircleMarker(
-        [inc['target_lat'], inc['target_lon']],
-        radius=6, color="darkred", fill=True, fill_color="red", fill_opacity=0.7,
-        popup="Incoming enemy missile"
+auto_tick = st.sidebar.checkbox("Auto tick every ~5s", True)
+
+if st.sidebar.button("Manual Tick"):
+    st.rerun()
+
+# ────────────────────────────────────────────────
+# Map
+# ────────────────────────────────────────────────
+m = folium.Map(location=[st.session_state.player_lat, st.session_state.player_lon], zoom_start=11, tiles="cartodbpositron")
+
+# Player marker
+folium.Marker(
+    [st.session_state.player_lat, st.session_state.player_lon],
+    popup="You (Player Base)",
+    tooltip="Your Position",
+    icon=folium.Icon(color="blue", icon="user", prefix="fa")
+).add_to(m)
+
+# 30 km build radius
+folium.Circle(
+    radius=MAX_BUILD_RADIUS_KM * 1000,  # meters
+    location=[st.session_state.player_lat, st.session_state.player_lon],
+    color="green", fill=True, fill_opacity=0.1, popup="Build area (30 km)"
+).add_to(m)
+
+# Structures
+for s in st.session_state.structures:
+    color = {"Missile Silo":"red", "SAM Site":"blue", "Airfield":"green"}[s['type']]
+    folium.Marker(
+        [s['lat'], s['lon']],
+        popup=f"{s['type']} #{s['id']} | Health: {s['health']}% | Missiles: {s.get('missiles',0)}",
+        icon=folium.Icon(color=color)
     ).add_to(m)
 
-# Render map & capture clicks
-clicked = st_folium(m, width=1000, height=600, returned_objects=["last_clicked", "last_object_clicked_tooltip"])
+# Jets (simple static for now)
+for j in st.session_state.jets:
+    if j['status'] in ['flying', 'landed']:
+        folium.Marker(
+            [j['lat'], j['lon']],
+            popup=f"Jet #{j['id']} | Missiles: {j['missiles_left']} | {j['status']}",
+            icon=folium.Icon(color="orange", icon="plane")
+        ).add_to(m)
 
-# Handle map click → place structure
+# Incoming missiles – show current position
+for inc in st.session_state.incoming_missiles:
+    progress = min(1.0, inc['progress'])
+    cur_lat = inc['start_lat'] + progress * (inc['target_lat'] - inc['start_lat'])
+    cur_lon = inc['start_lon'] + progress * (inc['target_lon'] - inc['start_lon'])
+    folium.CircleMarker(
+        [cur_lat, cur_lon],
+        radius=8, color="red", fill=True, fill_color="darkred",
+        popup=f"Enemy missile → approaching"
+    ).add_to(m)
+
+clicked = st_folium(m, width=1100, height=650)
+
+# Place building on click
 if clicked and clicked.get("last_clicked"):
-    lat = clicked["last_clicked"]["lat"]
-    lon = clicked["last_clicked"]["lng"]
+    clat = clicked["last_clicked"]["lat"]
+    clon = clicked["last_clicked"]["lng"]
+    dist_from_player = haversine(st.session_state.player_lat, st.session_state.player_lon, clat, clon)
 
-    st.info(f"Selected location: {lat:.4f}, {lon:.4f}")
-
-    if st.button(f"Build {build_choice} here (Cost ${COSTS[build_choice]})"):
+    if dist_from_player > MAX_BUILD_RADIUS_KM:
+        st.warning(f"Too far! You can only build within {MAX_BUILD_RADIUS_KM} km of your position.")
+    elif st.button(f"Place {build_choice} here (${COSTS[build_choice]})"):
         if st.session_state.resources >= COSTS[build_choice]:
             st.session_state.resources -= COSTS[build_choice]
             sid = len(st.session_state.structures) + 1
             st.session_state.structures.append({
                 'id': sid,
                 'type': build_choice,
-                'lat': lat,
-                'lon': lon,
+                'lat': clat,
+                'lon': clon,
                 'health': 100,
-                'built_at': time.time(),
-                'missiles': 6 if build_choice == "Missile Silo" else 0,
-                'jets': [] if build_choice == "Airfield" else None
+                'missiles': 6 if build_choice == "Missile Silo" else 0
             })
-            add_log(f"Built {build_choice} at {lat:.4f},{lon:.4f}")
+            add_log(f"Built {build_choice} #{sid} at {clat:.4f}, {clon:.4f}")
             st.rerun()
         else:
             st.error("Not enough resources!")
 
 # ────────────────────────────────────────────────
-# Jets & Missile Launch UI
-# ────────────────────────────────────────────────
-st.subheader("Airforce & Missile Control")
-
-col1, col2 = st.columns([3,2])
-
-with col1:
-    # List airfields & jets
-    airfields = [s for s in st.session_state.structures if s['type'] == "Airfield"]
-    if airfields:
-        af_choice = st.selectbox("Select Airfield", [f"Airfield #{a['id']} ({a['lat']:.3f},{a['lon']:.3f})" for a in airfields])
-        af_id = int(af_choice.split("#")[1].split()[0])
-        af = next(a for a in airfields if a['id'] == af_id)
-
-        # Build jet at airfield
-        if st.button(f"Build Jet at Airfield #{af_id} (Cost $1200)"):
-            if st.session_state.resources >= 1200:
-                st.session_state.resources -= 1200
-                jet_id = len(st.session_state.jets) + 1
-                st.session_state.jets.append({
-                    'id': jet_id,
-                    'from_airfield_id': af_id,
-                    'lat': af['lat'],
-                    'lon': af['lon'],
-                    'target_lat': None,
-                    'target_lon': None,
-                    'launched_at': None,
-                    'missiles_left': JET_MISSILES_DEFAULT,
-                    'status': 'landed'
-                })
-                add_log(f"Jet #{jet_id} built at Airfield #{af_id}")
-                st.rerun()
-            else:
-                st.warning("Not enough cash for jet!")
-
-    # Launch missile from silo or jet
-    launch_from = st.radio("Launch missile from", ["Silo", "Jet"])
-
-    if launch_from == "Silo":
-        silos = [s for s in st.session_state.structures if s['type'] == "Missile Silo" and s.get('missiles',0) > 0]
-        if silos:
-            silo_choice = st.selectbox("Select Silo", [f"Silo #{s['id']} ({s['missiles']} left)" for s in silos])
-            silo_id = int(silo_choice.split("#")[1].split()[0])
-    else:
-        flying_jets = [j for j in st.session_state.jets if j['status'] == 'flying' and j['missiles_left'] > 0]
-        landed_jets = [j for j in st.session_state.jets if j['status'] == 'landed' and j['missiles_left'] > 0]
-        jet_list = flying_jets + landed_jets
-        if jet_list:
-            jet_choice = st.selectbox("Select Jet", [f"Jet #{j['id']} ({j['missiles_left']} missiles left - {j['status']})" for j in jet_list])
-            jet_id_sel = int(jet_choice.split("#")[1].split()[0])
-            jet_sel = next(j for j in st.session_state.jets if j['id'] == jet_id_sel)
-
-with col2:
-    st.markdown("**Selected unit weapons**")
-    if launch_from == "Jet" and 'jet_sel' in locals():
-        st.info(f"Jet #{jet_sel['id']}\nMissiles: {jet_sel['missiles_left']}\nStatus: {jet_sel['status']}")
-    elif launch_from == "Silo" and 'silo_id' in locals():
-        silo = next(s for s in st.session_state.structures if s['id'] == silo_id)
-        st.info(f"Silo #{silo['id']}\nMissiles: {silo['missiles']}")
-
-# Target selection is done by clicking map while "target mode" active (simplified)
-st.caption("Click map to set target → then press launch button below")
-
-if 'pending_target' in st.session_state and st.session_state.pending_target:
-    tlat, tlon = st.session_state.pending_target
-    st.success(f"Target locked: {tlat:.4f}, {tlon:.4f}")
-
-    if st.button("LAUNCH MISSILE AT TARGET"):
-        if launch_from == "Silo" and 'silo_id' in locals():
-            silo = next(s for s in st.session_state.structures if s['id'] == silo_id)
-            if silo['missiles'] > 0:
-                silo['missiles'] -= 1
-                add_log(f"Missile launched from Silo #{silo_id} → {tlat:.4f},{tlon:.4f}")
-                # For simplicity, instant launch simulation (later add flight)
-                dist = haversine(silo['lat'], silo['lon'], tlat, tlon)
-                travel_sec = (dist / MISSILE_SPEED_KMH) * 3600
-                # ... could schedule hit later
-                st.session_state.pending_target = None
-                st.rerun()
-        elif launch_from == "Jet" and 'jet_sel' in locals():
-            if jet_sel['missiles_left'] > 0:
-                jet_sel['missiles_left'] -= 1
-                add_log(f"Jet #{jet_sel['id']} launched missile → {tlat:.4f},{tlon:.4f}")
-                # Could update jet target too if wanted
-                st.session_state.pending_target = None
-                st.rerun()
-
-# Click anywhere → potential target or build
-if clicked and clicked.get("last_clicked") and not st.button:  # avoid conflict with build button
-    st.session_state.pending_target = (clicked["last_clicked"]["lat"], clicked["last_clicked"]["lng"])
-
-# ────────────────────────────────────────────────
-# Simple simulation tick
+# Simulation tick
 # ────────────────────────────────────────────────
 now = time.time()
-if now - st.session_state.last_tick > 5 or st.button("Manual Tick"):
+if auto_tick and now - st.session_state.last_tick >= TICK_INTERVAL or st.button("Force Tick"):
     st.session_state.last_tick = now
 
-    # Grow resources slowly
-    st.session_state.resources += 15
+    st.session_state.resources += 20  # passive income
 
-    # Random enemy attack
-    if random.random() < ENEMY_TICK_CHANCE:
-        center_lat, center_lon = 19.0760, 72.8777
-        st.session_state.incoming.append({
-            'lat_from': center_lat + random.uniform(-2,2),
-            'lon_from': center_lon + random.uniform(-2,2),
-            'target_lat': center_lat + random.uniform(-0.4,0.4),
-            'target_lon': center_lon + random.uniform(-0.4,0.4),
+    # Spawn enemy missile ~every 15–40s randomly
+    if random.random() < 0.25:
+        offset = random.uniform(-0.8, 0.8)
+        st.session_state.incoming_missiles.append({
+            'start_lat': st.session_state.player_lat + offset * 2,
+            'start_lon': st.session_state.player_lon + offset * 2,
+            'target_lat': st.session_state.player_lat + random.uniform(-0.15, 0.15),
+            'target_lon': st.session_state.player_lon + random.uniform(-0.15, 0.15),
             'launched_at': now,
-            'speed_km_s': 3000 / 3600,
+            'progress': 0.0,
+            'speed': random.uniform(0.08, 0.15)   # fraction per tick
         })
-        add_log("Enemy launched missile!")
+        add_log("Incoming enemy missile detected!")
 
-    # Update flying jets (simple move toward target if set)
-    for jet in st.session_state.jets:
-        if jet['status'] == 'flying' and jet['target_lat'] is not None:
-            dist = haversine(jet['lat'], jet['lon'], jet['target_lat'], jet['target_lon'])
-            move_km = (JET_SPEED_KMH / 3600) * 5   # per tick
-            if dist <= move_km:
-                jet['lat'] = jet['target_lat']
-                jet['lon'] = jet['target_lon']
-                jet['status'] = 'landed'
-            else:
-                # move fraction toward target
-                frac = move_km / dist
-                jet['lat'] += frac * (jet['target_lat'] - jet['lat'])
-                jet['lon'] += frac * (jet['target_lon'] - jet['lon'])
-
-    # Very basic incoming missile resolution
-    still_incoming = []
-    for inc in st.session_state.incoming:
-        dist_left = haversine(inc['lat_from'], inc['lon_from'], inc['target_lat'], inc['target_lon'])
-        traveled = (now - inc['launched_at']) * inc['speed_km_s']
-        if traveled >= dist_left:
-            add_log("Enemy missile HIT target area!")
-            # Could damage nearest structure here
+    # Move missiles
+    still_alive = []
+    for inc in st.session_state.incoming_missiles:
+        inc['progress'] += inc['speed']
+        if inc['progress'] >= 1.0:
+            # Hit!
+            add_log("Enemy missile IMPACT!")
+            # Damage random nearby structure
+            nearby = [s for s in st.session_state.structures if haversine(s['lat'], s['lon'], inc['target_lat'], inc['target_lon']) < 5]
+            if nearby:
+                victim = random.choice(nearby)
+                victim['health'] = max(0, victim['health'] - random.randint(25, 60))
+                add_log(f"Structure #{victim['id']} damaged! Health now {victim['health']}%")
         else:
-            # Check interception by nearby SAM
+            # Check SAM interception
             intercepted = False
             for s in st.session_state.structures:
-                if s['type'] == "SAM Site":
-                    d = haversine(s['lat'], s['lon'], inc['target_lat'], inc['target_lon'])
-                    if d < 15 and random.random() < 0.55:  # 55% chance if close
-                        add_log("SAM intercepted enemy missile!")
+                if s['type'] == "SAM Site" and haversine(s['lat'], s['lon'], inc['target_lat'], inc['target_lon']) < 18:
+                    if random.random() < 0.6:
+                        add_log("SAM site intercepted enemy missile!")
                         intercepted = True
                         break
             if not intercepted:
-                still_incoming.append(inc)
-    st.session_state.incoming = still_incoming
+                still_alive.append(inc)
+    st.session_state.incoming_missiles = still_alive
 
-    st.rerun()   # refresh UI
+    st.rerun()
 
-# ────────────────────────────────────────────────
 # Log
-# ────────────────────────────────────────────────
-with st.expander("Event Log"):
-    for line in reversed(st.session_state.log):
-        st.caption(line)
+with st.expander("Event Log", expanded=True):
+    for line in reversed(st.session_state.log[-12:]):
+        st.markdown(line)
